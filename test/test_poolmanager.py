@@ -103,6 +103,31 @@ class TestPoolManager:
         p.clear()
         assert len(p.pools) == 0
 
+    def test_retry_budget_disabled_by_default(self) -> None:
+        with PoolManager() as manager:
+            pool = manager.connection_from_url("http://example.com/")
+            assert pool.retry_budget is None
+
+    def test_retry_budget_tracked_per_origin(self) -> None:
+        with PoolManager(retry_budget=3) as manager:
+            pool = manager.connection_from_url("http://example.com/")
+            assert pool.retry_budget is not None
+            assert pool.retry_budget.max_tokens == 3
+            assert pool.retry_budget.tokens == 3
+
+            # A distinct pool for the same origin shares the budget.
+            same_origin = manager.connection_from_url(
+                "http://example.com/", pool_kwargs={"maxsize": 5}
+            )
+            assert same_origin is not pool
+            assert same_origin.retry_budget is pool.retry_budget
+
+            # Other origins get their own budget.
+            other_host = manager.connection_from_url("http://example.org/")
+            assert other_host.retry_budget is not pool.retry_budget
+            other_scheme = manager.connection_from_url("https://example.com/")
+            assert other_scheme.retry_budget is not pool.retry_budget
+
     @pytest.mark.parametrize("url", ["http://@", None])
     def test_nohost(self, url: str | None) -> None:
         p = PoolManager(5)

@@ -4,7 +4,7 @@ from __future__ import annotations
 from .connection import is_connection_dropped
 from .request import SKIP_HEADER, SKIPPABLE_HEADERS, make_headers
 from .response import is_fp_closed
-from .retry import Retry
+from .retry import Retry, RetryBudget
 from .ssl_ import (
     ALPN_PROTOCOLS,
     IS_PYOPENSSL,
@@ -24,6 +24,7 @@ __all__ = (
     "SSLContext",
     "ALPN_PROTOCOLS",
     "Retry",
+    "RetryBudget",
     "Timeout",
     "Url",
     "assert_fingerprint",

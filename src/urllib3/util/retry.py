@@ -4,6 +4,7 @@ import email
 import logging
 import random
 import re
+import threading
 import time
 import typing
 import warnings
@@ -567,3 +568,73 @@ class Retry:
 
 # For backwards compatibility (equivalent to pre-v1.9):
 Retry.DEFAULT = Retry(3)
+
+
+class RetryBudget:
+    """A token bucket that throttles retries across concurrent requests.
+
+    A single budget is shared by all the requests made against one origin
+    (scheme, host, and port), no matter how many threads are using the
+    connection pool. Every retry spends one token and every response that
+    is returned without exhausting retries puts one token back, so the
+    budget refills itself while the origin is healthy. Once the bucket is
+    empty, further retries fail fast instead of amplifying load against a
+    server that is already struggling.
+
+    Budgets are normally created and managed by
+    :class:`~urllib3.PoolManager` (see its ``retry_budget`` parameter) and
+    attached to each connection pool as :attr:`pool.retry_budget
+    <urllib3.HTTPConnectionPool>`.
+
+    :param int max_tokens:
+        Maximum number of tokens the bucket can hold. The bucket starts
+        full. Retries are only throttled once this many tokens have been
+        spent without being replenished by successful responses.
+    """
+
+    def __init__(self, max_tokens: int) -> None:
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be greater than or equal to 0")
+        self._max_tokens = max_tokens
+        self._tokens = max_tokens
+        self._lock = threading.Lock()
+
+    @property
+    def max_tokens(self) -> int:
+        """Maximum number of tokens the bucket can hold."""
+        return self._max_tokens
+
+    @property
+    def tokens(self) -> int:
+        """Number of tokens currently available.
+
+        This is a point-in-time gauge: concurrent requests may spend or
+        replenish tokens at any moment, so the value may be stale as soon
+        as it is read.
+        """
+        return self._tokens
+
+    def acquire(self) -> bool:
+        """Spend one token, returning whether one was available.
+
+        The read, check, and decrement are performed as a single atomic
+        operation so that concurrent threads cannot spend the same token.
+        """
+        with self._lock:
+            if self._tokens <= 0:
+                return False
+            self._tokens -= 1
+            return True
+
+    def release(self) -> None:
+        """Put one token back into the bucket.
+
+        Tokens beyond :attr:`max_tokens` are dropped. This deliberately
+        does not take the lock to keep the success path cheap: a plain
+        attribute store cannot tear, at the cost of the bucket briefly
+        holding a few tokens too many or too few under concurrency before
+        settling back.
+        """
+        tokens = self._tokens
+        if tokens < self._max_tokens:
+            self._tokens = tokens + 1

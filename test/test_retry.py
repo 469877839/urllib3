@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import threading
 from test import DUMMY_POOL
 from unittest import mock
 
@@ -15,7 +16,7 @@ from urllib3.exceptions import (
     SSLError,
 )
 from urllib3.response import HTTPResponse
-from urllib3.util.retry import RequestHistory, Retry
+from urllib3.util.retry import RequestHistory, Retry, RetryBudget
 
 
 class TestRetry:
@@ -456,3 +457,56 @@ class TestRetry:
                 sleep_mock.assert_called_with(sleep_duration)
             else:
                 sleep_mock.assert_not_called()
+
+
+class TestRetryBudget:
+    def test_starts_full(self) -> None:
+        budget = RetryBudget(3)
+        assert budget.max_tokens == 3
+        assert budget.tokens == 3
+
+    def test_negative_max_tokens_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            RetryBudget(-1)
+
+    def test_acquire_spends_tokens_until_empty(self) -> None:
+        budget = RetryBudget(2)
+        assert budget.acquire()
+        assert budget.tokens == 1
+        assert budget.acquire()
+        assert budget.tokens == 0
+        assert not budget.acquire()
+        assert budget.tokens == 0
+
+    def test_zero_budget_never_acquires(self) -> None:
+        budget = RetryBudget(0)
+        assert not budget.acquire()
+
+    def test_release_replenishes_up_to_max(self) -> None:
+        budget = RetryBudget(2)
+        assert budget.acquire()
+        budget.release()
+        assert budget.tokens == 2
+        # Tokens beyond the maximum are dropped.
+        budget.release()
+        assert budget.tokens == 2
+
+    def test_acquire_is_atomic_across_threads(self) -> None:
+        budget = RetryBudget(10)
+        acquired = 0
+        lock = threading.Lock()
+
+        def worker() -> None:
+            nonlocal acquired
+            while budget.acquire():
+                with lock:
+                    acquired += 1
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert acquired == 10
+        assert budget.tokens == 0

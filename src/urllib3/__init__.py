@@ -20,7 +20,7 @@ from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
 from .response import BaseHTTPResponse, HTTPResponse
 from .util.request import make_headers
-from .util.retry import Retry
+from .util.retry import Retry, RetryBudget
 from .util.timeout import Timeout
 
 # Ensure that Python is compiled with OpenSSL 1.1.1+
@@ -57,6 +57,7 @@ __all__ = (
     "ProxyManager",
     "HTTPResponse",
     "Retry",
+    "RetryBudget",
     "Timeout",
     "add_stderr_logger",
     "connection_from_url",

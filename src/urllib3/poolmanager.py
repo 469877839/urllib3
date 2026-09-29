@@ -20,7 +20,7 @@ from .exceptions import (
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
-from .util.retry import Retry
+from .util.retry import Retry, RetryBudget
 from .util.timeout import Timeout
 from .util.url import Url, parse_url
 
@@ -179,6 +179,18 @@ class PoolManager(RequestMethods):
         Headers to include with all requests, unless other headers are given
         explicitly.
 
+    :param retry_budget:
+        Maximum number of retry tokens available per origin (scheme, host,
+        and port). When set, every connection pool created by this manager
+        gets its own :class:`~urllib3.util.retry.RetryBudget`, shared by
+        all requests made through that pool: each retry spends one token
+        and each response returned without exhausting retries puts one
+        token back. Once a budget is empty, requests to that origin fail
+        fast with :class:`~urllib3.exceptions.MaxRetryError` instead of
+        retrying, which keeps concurrent clients from amplifying load
+        against an unhealthy origin. ``None`` (the default) disables
+        retry budgets.
+
     :param \\**connection_pool_kw:
         Additional parameters are used to create fresh
         :class:`urllib3.connectionpool.ConnectionPool` instances.
@@ -207,6 +219,7 @@ class PoolManager(RequestMethods):
         self,
         num_pools: int = 10,
         headers: typing.Mapping[str, str] | None = None,
+        retry_budget: int | None = None,
         **connection_pool_kw: typing.Any,
     ) -> None:
         super().__init__(headers)
@@ -225,6 +238,11 @@ class PoolManager(RequestMethods):
                 connection_pool_kw = connection_pool_kw.copy()
                 connection_pool_kw["retries"] = retries
         self.connection_pool_kw = connection_pool_kw
+
+        self._retry_budget_max = retry_budget
+        # One retry budget per origin (scheme, host, port), handed to the
+        # connection pool of that origin when the pool is created.
+        self._retry_budgets: dict[tuple[str, str, int | None], RetryBudget] = {}
 
         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
         self.pools = RecentlyUsedContainer(num_pools)
@@ -370,9 +388,30 @@ class PoolManager(RequestMethods):
             host = request_context["host"]
             port = request_context["port"]
             pool = self._new_pool(scheme, host, port, request_context=request_context)
+            budget = self._retry_budget_for(pool_key)
+            if budget is not None:
+                pool.retry_budget = budget
             self.pools[pool_key] = pool
 
         return pool
+
+    def _retry_budget_for(self, pool_key: PoolKey) -> RetryBudget | None:
+        """
+        Get or create the :class:`~urllib3.util.retry.RetryBudget` for the
+        origin identified by ``pool_key``, or return None if retry budgets
+        are disabled.
+
+        Must be called with ``self.pools.lock`` held.
+        """
+        max_tokens = self._retry_budget_max
+        if max_tokens is None:
+            return None
+        origin = (pool_key.key_scheme, pool_key.key_host, pool_key.key_port)
+        budget = self._retry_budgets.get(origin)
+        if budget is None:
+            budget = RetryBudget(max_tokens)
+            self._retry_budgets[origin] = budget
+        return budget
 
     def connection_from_url(
         self, url: str, pool_kwargs: dict[str, typing.Any] | None = None

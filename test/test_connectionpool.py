@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.client as httplib
 import queue
 import ssl
+import threading
 import typing
 from http.client import HTTPException
 from queue import Empty
@@ -32,11 +33,13 @@ from urllib3.exceptions import (
     MaxRetryError,
     ProtocolError,
     ReadTimeoutError,
+    ResponseError,
     SSLError,
     TimeoutError,
     UnrewindableBodyError,
 )
 from urllib3.response import HTTPResponse
+from urllib3.util.retry import RetryBudget
 from urllib3.util.ssl_match_hostname import CertificateError
 from urllib3.util.timeout import _DEFAULT_TIMEOUT, Timeout
 
@@ -903,3 +906,147 @@ class TestConnectionPool:
             "http://[fe80::1%251]:8080/next?x=%23",
             "http://[fe80::1%251]:8080/next?x=%23",
         ]
+
+    def test_retry_budget_defaults_to_disabled(self) -> None:
+        with HTTPConnectionPool(host="localhost") as pool:
+            assert pool.retry_budget is None
+
+    def test_retry_budget_throttles_connection_error_retries(self) -> None:
+        budget = RetryBudget(2)
+        with HTTPConnectionPool(
+            host="localhost", maxsize=8, retry_budget=budget
+        ) as pool:
+            with patch.object(
+                pool, "_make_request", side_effect=HTTPException("down")
+            ) as mock_request:
+                with pytest.raises(MaxRetryError) as excinfo:
+                    pool.urlopen("GET", "/", retries=Retry(total=10))
+
+        # One initial request plus the two retries the budget paid for;
+        # the remaining retries fail fast instead of being issued.
+        assert mock_request.call_count == 3
+        assert budget.tokens == 0
+        assert isinstance(excinfo.value.reason, ProtocolError)
+
+    def test_retry_budget_kept_when_retries_exhausted_normally(self) -> None:
+        budget = RetryBudget(10)
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with patch.object(
+                pool, "_make_request", side_effect=HTTPException("down")
+            ) as mock_request:
+                with pytest.raises(MaxRetryError):
+                    pool.urlopen("GET", "/", retries=Retry(total=2))
+
+        assert mock_request.call_count == 3
+        assert budget.tokens == 8
+
+    def test_retry_budget_replenished_on_success(self) -> None:
+        budget = RetryBudget(1)
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with patch.object(
+                pool,
+                "_make_request",
+                side_effect=[HTTPException("down"), HTTPResponse(status=200)],
+            ):
+                response = pool.urlopen("GET", "/", retries=Retry(total=5))
+
+        assert response.status == 200
+        # The retry spent one token and the successful response put it back.
+        assert budget.tokens == 1
+
+    def test_retry_budget_exhausted_status_retry_raises(self) -> None:
+        budget = RetryBudget(1)
+        retries = Retry(total=10, status_forcelist=[503])
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with patch.object(
+                pool,
+                "_make_request",
+                side_effect=[HTTPResponse(status=503), HTTPResponse(status=503)],
+            ) as mock_request:
+                with pytest.raises(MaxRetryError) as excinfo:
+                    pool.urlopen("GET", "/", retries=retries)
+
+        assert mock_request.call_count == 2
+        assert budget.tokens == 0
+        assert isinstance(excinfo.value.reason, ResponseError)
+        assert "too many 503 error responses" in str(excinfo.value)
+
+    def test_retry_budget_exhausted_status_retry_returns_response(self) -> None:
+        budget = RetryBudget(1)
+        retries = Retry(total=10, status_forcelist=[503], raise_on_status=False)
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with patch.object(
+                pool,
+                "_make_request",
+                side_effect=[HTTPResponse(status=503), HTTPResponse(status=503)],
+            ) as mock_request:
+                response = pool.urlopen("GET", "/", retries=retries)
+
+        assert mock_request.call_count == 2
+        assert response.status == 503
+        assert budget.tokens == 0
+
+    def test_retry_budget_not_spent_on_redirect(self) -> None:
+        budget = RetryBudget(0)
+        redirect_response = HTTPResponse(status=302, headers={"location": "/next"})
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with patch.object(
+                pool,
+                "_make_request",
+                side_effect=[redirect_response, HTTPResponse(status=200)],
+            ) as mock_request:
+                response = pool.urlopen("GET", "/", retries=Retry(total=5, redirect=5))
+
+        assert response.status == 200
+        assert mock_request.call_count == 2
+
+    def test_retry_budget_refunded_when_sleep_interrupted(self) -> None:
+        budget = RetryBudget(1)
+        with HTTPConnectionPool(host="localhost", retry_budget=budget) as pool:
+            with (
+                patch.object(pool, "_make_request", side_effect=HTTPException("down")),
+                patch.object(Retry, "sleep", side_effect=RuntimeError("boom")),
+            ):
+                with pytest.raises(RuntimeError, match="boom"):
+                    pool.urlopen("GET", "/", retries=Retry(total=5))
+
+        # The retry never happened, so the token was put back.
+        assert budget.tokens == 1
+
+    def test_retry_budget_shared_across_threads(self) -> None:
+        budget = RetryBudget(5)
+        num_threads = 8
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def always_down(*args: typing.Any, **kwargs: typing.Any) -> None:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            raise HTTPException("down")
+
+        def worker(pool: HTTPConnectionPool, errors: list[BaseException]) -> None:
+            try:
+                pool.urlopen("GET", "/", retries=Retry(total=10))
+            except MaxRetryError as e:
+                errors.append(e)
+
+        with HTTPConnectionPool(
+            host="localhost", maxsize=num_threads, retry_budget=budget
+        ) as pool:
+            with patch.object(pool, "_make_request", side_effect=always_down):
+                errors: list[BaseException] = []
+                threads = [
+                    threading.Thread(target=worker, args=(pool, errors))
+                    for _ in range(num_threads)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+        # Every thread fails, but the budget only paid for 5 retries
+        # across all of them instead of 10 each.
+        assert len(errors) == num_threads
+        assert calls == num_threads + 5
+        assert budget.tokens == 0

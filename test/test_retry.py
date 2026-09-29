@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import threading
 from test import DUMMY_POOL
 from unittest import mock
 
@@ -15,7 +16,7 @@ from urllib3.exceptions import (
     SSLError,
 )
 from urllib3.response import HTTPResponse
-from urllib3.util.retry import RequestHistory, Retry
+from urllib3.util.retry import RequestHistory, Retry, RetryBudget
 
 
 class TestRetry:
@@ -456,3 +457,51 @@ class TestRetry:
                 sleep_mock.assert_called_with(sleep_duration)
             else:
                 sleep_mock.assert_not_called()
+
+
+class TestRetryBudget:
+    def test_starts_full(self) -> None:
+        budget = RetryBudget(3)
+        assert budget.capacity == 3
+        assert budget.remaining == 3
+
+    def test_negative_budget_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            RetryBudget(-1)
+
+    def test_acquire_until_exhausted(self) -> None:
+        budget = RetryBudget(2)
+        assert budget.acquire() is True
+        assert budget.remaining == 1
+        assert budget.acquire() is True
+        assert budget.remaining == 0
+        assert budget.acquire() is False
+        assert budget.remaining == 0
+
+    def test_release_caps_at_capacity(self) -> None:
+        budget = RetryBudget(1)
+        budget.release()
+        assert budget.remaining == 1
+        assert budget.acquire() is True
+        budget.release()
+        assert budget.remaining == 1
+
+    def test_acquire_is_atomic_across_threads(self) -> None:
+        budget = RetryBudget(10)
+        acquired = 0
+        lock = threading.Lock()
+
+        def worker() -> None:
+            nonlocal acquired
+            while budget.acquire():
+                with lock:
+                    acquired += 1
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert acquired == 10
+        assert budget.remaining == 0

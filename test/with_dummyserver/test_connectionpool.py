@@ -8,7 +8,7 @@ import time
 import typing
 import warnings
 from test import LONG_TIMEOUT, SHORT_TIMEOUT
-from threading import Event
+from threading import Barrier, Event, Thread
 from unittest import mock
 from urllib.parse import urlencode
 
@@ -1408,6 +1408,90 @@ class TestRetryAfter(HypercornDummyServerTestCase):
             delta = time.time() - t
             assert r.status == 200
             assert delta < 1
+
+
+class TestRetryBudget(HypercornDummyServerTestCase):
+    def test_budget_disabled_by_default(self) -> None:
+        with HTTPConnectionPool(self.host, self.port) as pool:
+            assert pool.retry_budget is None
+            r = pool.request("GET", "/")
+            assert r.status == 200
+
+    def test_successful_request_keeps_budget_full(self) -> None:
+        with HTTPConnectionPool(self.host, self.port, retry_budget=2) as pool:
+            assert pool.retry_budget is not None
+            r = pool.request("GET", "/")
+            assert r.status == 200
+            assert pool.retry_budget.remaining == 2
+
+    def test_retry_consumes_budget_and_success_refills(self) -> None:
+        with HTTPConnectionPool(self.host, self.port, retry_budget=2) as pool:
+            assert pool.retry_budget is not None
+            headers = {"test-name": "test_retry_consumes_budget_and_success_refills"}
+            retry = Retry(total=2, status_forcelist=[418])
+            r = pool.request("GET", "/successful_retry", headers=headers, retries=retry)
+            assert r.status == 200
+            # One token spent on the retry, one token put back on success.
+            assert pool.retry_budget.remaining == 2
+
+    def test_budget_exhaustion_raises_like_retries_exhausted(self) -> None:
+        with HTTPConnectionPool(self.host, self.port, retry_budget=1) as pool:
+            assert pool.retry_budget is not None
+            retry = Retry(total=10, status_forcelist=[418])
+            with pytest.raises(MaxRetryError) as excinfo:
+                pool.request("GET", "/status?status=418", retries=retry)
+            assert "too many 418 error responses" in str(excinfo.value)
+            assert pool.retry_budget.remaining == 0
+
+    def test_budget_exhaustion_returns_response_without_raise_on_status(
+        self,
+    ) -> None:
+        with HTTPConnectionPool(self.host, self.port, retry_budget=1) as pool:
+            assert pool.retry_budget is not None
+            retry = Retry(total=10, status_forcelist=[418], raise_on_status=False)
+            r = pool.request("GET", "/status?status=418", retries=retry)
+            assert r.status == 418
+            assert pool.retry_budget.remaining == 0
+
+    def test_redirects_do_not_consume_budget(self) -> None:
+        # A budget of zero would block any real retry, but redirects and
+        # the final successful response must still go through.
+        with HTTPConnectionPool(self.host, self.port, retry_budget=0) as pool:
+            assert pool.retry_budget is not None
+            r = pool.request("GET", "/redirect", fields={"target": "/"})
+            assert r.status == 200
+            assert pool.retry_budget.remaining == 0
+
+    def test_budget_refunded_if_sleep_fails(self) -> None:
+        with HTTPConnectionPool(self.host, self.port, retry_budget=1) as pool:
+            assert pool.retry_budget is not None
+            retry = Retry(total=3, status_forcelist=[418])
+            with (
+                mock.patch.object(Retry, "sleep", side_effect=RuntimeError("boom")),
+                pytest.raises(RuntimeError, match="boom"),
+            ):
+                pool.request("GET", "/status?status=418", retries=retry)
+            assert pool.retry_budget.remaining == 1
+
+    def test_budget_is_shared_across_threads(self) -> None:
+        # Eight threads each carrying Retry(total=10) can only spend the
+        # tokens actually in the pool-wide budget.
+        with HTTPConnectionPool(self.host, self.port, retry_budget=3) as pool:
+            assert pool.retry_budget is not None
+            retry = Retry(total=10, status_forcelist=[418], raise_on_status=False)
+            barrier = Barrier(8)
+
+            def worker() -> None:
+                barrier.wait()
+                pool.request("GET", "/status?status=418", retries=retry)
+
+            threads = [Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            assert pool.retry_budget.remaining == 0
 
 
 class TestFileBodiesOnRetryOrRedirect(HypercornDummyServerTestCase):

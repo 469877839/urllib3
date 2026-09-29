@@ -36,6 +36,7 @@ from .exceptions import (
     ProtocolError,
     ProxyError,
     ReadTimeoutError,
+    ResponseError,
     SSLError,
     TimeoutError,
 )
@@ -43,7 +44,7 @@ from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
 from .util.request import _TYPE_BODY_POSITION, set_file_position
-from .util.retry import Retry
+from .util.retry import Retry, RetryBudget
 from .util.ssl_match_hostname import CertificateError
 from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_DEFAULT, Timeout
 from .util.url import Url, _encode_target
@@ -162,6 +163,16 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
     :param retries:
         Retry configuration to use by default with requests in this pool.
 
+    :param retry_budget:
+        If set to an integer, create a :class:`~urllib3.util.retry.RetryBudget`
+        of that size owned by this pool. Every retry issued through this pool
+        (across all threads sharing it) must first take a token out of the
+        budget, and every successful response puts one token back, so a
+        failing origin cannot amplify its request rate beyond the budget no
+        matter how many requests are in flight. Redirects do not consume the
+        budget. If ``None`` (the default), retries are not budgeted and
+        behave exactly as before.
+
     :param _proxy:
         Parsed proxy URL, should not be used directly, instead, see
         :class:`urllib3.ProxyManager`
@@ -187,6 +198,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         block: bool = False,
         headers: typing.Mapping[str, str] | None = None,
         retries: Retry | bool | int | None = None,
+        retry_budget: int | None = None,
         _proxy: Url | None = None,
         _proxy_headers: typing.Mapping[str, str] | None = None,
         _proxy_config: ProxyConfig | None = None,
@@ -203,6 +215,9 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         self.timeout = timeout
         self.retries = retries
+        self.retry_budget = (
+            RetryBudget(retry_budget) if retry_budget is not None else None
+        )
 
         self.pool: queue.LifoQueue[typing.Any] | None = self._new_pool_queue(maxsize)
         self.block = block
@@ -851,7 +866,16 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
             retries = retries.increment(
                 method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
             )
-            retries.sleep()
+            if not self._acquire_retry_budget():
+                raise MaxRetryError(self, url, new_e) from new_e
+            try:
+                retries.sleep()
+            except BaseException:
+                # The retry was paid for but never issued (e.g. the
+                # connection was closed mid-sleep), so refund the token
+                # instead of leaking it.
+                self._release_retry_budget()
+                raise
 
             # Keep track of the error for the retry warning.
             err = e
@@ -972,8 +996,27 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                     raise
                 return response
 
+            if not self._acquire_retry_budget():
+                # The budget is shared by every thread using this pool, so
+                # treat its exhaustion like running out of retries.
+                if retries.raise_on_status:
+                    response.drain_conn()
+                    cause = ResponseError.GENERIC_ERROR
+                    if response.status:
+                        cause = ResponseError.SPECIFIC_ERROR.format(
+                            status_code=response.status
+                        )
+                    reason = ResponseError(cause)
+                    raise MaxRetryError(self, url, reason) from reason
+                return response
+
             response.drain_conn()
-            retries.sleep(response)
+            try:
+                retries.sleep(response)
+            except BaseException:
+                # The retry was paid for but never issued, refund the token.
+                self._release_retry_budget()
+                raise
             log.debug("Retry: %s", url)
             return self.urlopen(
                 method,
@@ -993,7 +1036,23 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 **response_kw,
             )
 
+        self._release_retry_budget()
         return response
+
+    def _acquire_retry_budget(self) -> bool:
+        """Take one token out of this pool's retry budget, if any.
+
+        Returns ``True`` when the retry may proceed: either no budget is
+        configured or a token was available and has been deducted.
+        """
+        budget = self.retry_budget
+        return budget is None or budget.acquire()
+
+    def _release_retry_budget(self) -> None:
+        """Put one token back into this pool's retry budget, if any."""
+        budget = self.retry_budget
+        if budget is not None:
+            budget.release()
 
 
 class HTTPSConnectionPool(HTTPConnectionPool):
@@ -1022,6 +1081,7 @@ class HTTPSConnectionPool(HTTPConnectionPool):
         block: bool = False,
         headers: typing.Mapping[str, str] | None = None,
         retries: Retry | bool | int | None = None,
+        retry_budget: int | None = None,
         _proxy: Url | None = None,
         _proxy_headers: typing.Mapping[str, str] | None = None,
         key_file: str | None = None,
@@ -1045,8 +1105,9 @@ class HTTPSConnectionPool(HTTPConnectionPool):
             block,
             headers,
             retries,
-            _proxy,
-            _proxy_headers,
+            retry_budget=retry_budget,
+            _proxy=_proxy,
+            _proxy_headers=_proxy_headers,
             **conn_kw,
         )
 

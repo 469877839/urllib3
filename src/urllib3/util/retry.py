@@ -4,6 +4,7 @@ import email
 import logging
 import random
 import re
+import threading
 import time
 import typing
 import warnings
@@ -38,6 +39,62 @@ class RequestHistory(typing.NamedTuple):
     error: Exception | None
     status: int | None
     redirect_location: str | None
+
+
+class RetryBudget:
+    """A thread-safe budget limiting how many retries may be in flight
+    against a single origin at the same time.
+
+    Each instance is meant to be owned by exactly one connection pool so
+    that unrelated origins never share a budget. A retry attempt must
+    :meth:`acquire` a token before it is issued; a token is :meth:`release`d
+    back into the budget when a request returns successfully or when a
+    previously acquired attempt is aborted before being issued.
+
+    Acquiring is a single atomic check-and-decrement guarded by a lock so
+    that concurrent threads can never observe the same last token. Releasing
+    is deliberately lock-free: the increment cannot tear, and any overflow
+    beyond the capacity is discarded. Under concurrent successes the bucket
+    may briefly hold a few tokens more than strictly accounted for, which
+    drains back down on subsequent retries.
+    """
+
+    def __init__(self, budget: int) -> None:
+        if budget < 0:
+            raise ValueError("budget must be greater than or equal to 0")
+        self._capacity = budget
+        self._remaining = budget
+        self._lock = threading.Lock()
+
+    @property
+    def capacity(self) -> int:
+        """The maximum number of tokens the budget can hold."""
+        return self._capacity
+
+    @property
+    def remaining(self) -> int:
+        """The number of tokens currently available. Read-only."""
+        return self._remaining
+
+    def acquire(self) -> bool:
+        """Atomically take one token out of the budget.
+
+        Returns ``True`` if a token was available and has been deducted,
+        ``False`` if the budget is exhausted.
+        """
+        with self._lock:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+            return True
+
+    def release(self) -> None:
+        """Put one token back into the budget, discarding any overflow
+        beyond the capacity.
+        """
+        remaining = self._remaining
+        if remaining < self._capacity:
+            self._remaining = remaining + 1
 
 
 class Retry:
